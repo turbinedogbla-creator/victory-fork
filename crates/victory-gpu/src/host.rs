@@ -1854,24 +1854,21 @@ fn rehash_runs() -> bool {
 static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Whether what shaders wrote to copies in the card's memory is merged
-/// into title memory on several threads (`VICTORY_WIDE_MERGE`; on by
-/// default, `=0`: one after the other, as before), by the settle and by
-/// the relay's landings. The pieces the card's compare found differing come down in
+/// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
+/// default), by the settle and by the relay's landings. The pieces the card's compare found differing come down in
 /// one fetch and were then merged one after the other on the thread that
 /// settles: about 630 pieces and 40 MB a frame (run 104), each compared
 /// with the copy's CPU side byte by byte and put into title memory through
 /// the kernel. A piece is its own bytes of its copy and of title memory,
 /// so eight threads take an eighth of them each.
 ///
-/// On by default, for the relay's landings too, since an RTX 4070 / Ryzen 5
-/// 7500F run: some 1,250 pieces of 64 KiB a frame, 96 % of them with bytes
-/// shaders wrote (34 MB of 78), merged one after the other on the thread
-/// that lands flights, 45-60 ms a frame; the title's fences are set only
-/// once their flights have landed. A merge takes the locks of its own
-/// blocks only (`crate::shadow::side_locks`).
+/// For the relay's landings too (some 1,250 pieces of 64 KiB a frame, 96 %
+/// of them with bytes shaders wrote, 34 MB of 78; a merge takes the locks
+/// of its own blocks only, `crate::shadow::side_locks`). Measured on an
+/// RTX 4070 / Ryzen 5 7500F: no change in the frame, so it stays off.
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
 }
 
 /// One declared range of a copy in the card's memory, in a submission.
