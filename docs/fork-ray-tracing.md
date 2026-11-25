@@ -35,11 +35,14 @@ shaders and emulates the one instruction.
 
 ## What this fork adds
 
-1. **The builder programs translate** (49 of 52; all that the title creates in
-   the scenes tested). They pass buffer addresses in a spilled parameter table
-   rather than in descriptors. Added: the spilled user-data table, root
-   unordered-access views (translator and host binding), byte and 16-bit buffer
-   accesses, and several control-flow shapes.
+1. **The builder programs translate** (all 52). They pass buffer addresses in
+   a spilled parameter table rather than in descriptors. Added: the spilled
+   user-data table, root unordered-access views (translator and host binding),
+   byte and 16-bit buffer accesses, and several control-flow shapes. On a GPU
+   with 32-lane waves, three of them (prefix sums over groups of 256 and 512
+   threads, whose 64-lane waves read lanes across their halves) run in the
+   paired form: one host wave for each console wave, each thread two of its
+   lanes.
 2. **Title memory by raw address from shaders.** A directory with one entry per
    64 KiB of title address space leads a shader to the layer's host copy of
    that memory; loads, stores, atomic add/sub and float min/max go through it.
@@ -63,9 +66,13 @@ shaders and emulates the one instruction.
 
 ## Known gaps
 
-- With `VICTORY_BVH_BUILDER=1` the builder still stays off in a real run: a few
-  of its pipelines are refused by the host (they still ask for 64-lane waves on
-  a 32-lane GPU) or do not translate.
+- With `VICTORY_BVH_BUILDER=1` the builder is not usable yet. Until the
+  paired form, three of its programs did not translate on a 32-lane GPU,
+  which kept it off; every builder pipeline is now created offline
+  (`victory translate --pipelines` with `VICTORY_HOST_MAX_WAVE=32`). Switched
+  on in game runs on an RTX 5090, with or without `VICTORY_BVH_QUARANTINE=1`,
+  the title crashed about 80 s into the gameplay, reading a pointer of all
+  ones.
 - Five shadow-mask trace programs do not translate yet.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).

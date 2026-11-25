@@ -55,8 +55,9 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::core::Interface;
 
@@ -225,10 +226,10 @@ impl Lane {
     /// An open list of the copy type: one whose last job the card has run,
     /// or a new one.
     pub(crate) fn list(&self) -> windows::core::Result<CopyList> {
-        // SAFETY: a plain query; a list is reset only when the job it ran
-        // in is done; plain object creation otherwise.
+        let done = self.completed_value()?;
+        // SAFETY: a list is reset only when the job it ran in is done;
+        // plain object creation otherwise.
         unsafe {
-            let done = self.fence.GetCompletedValue();
             let free = {
                 let mut state = lock(&self.state);
                 state.spare.iter().position(|(job, _)| *job <= done).map(|at| state.spare.swap_remove(at).1)
@@ -281,23 +282,40 @@ impl Lane {
         }
     }
 
-    /// Whether the card has run `job`.
-    pub(crate) fn done(&self, job: u64) -> bool {
+    fn completed_value(&self) -> windows::core::Result<u64> {
         // SAFETY: a plain query.
-        unsafe { self.fence.GetCompletedValue() >= job }
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        if completed == u64::MAX {
+            // D3D12 signals this value on removal, including for jobs that
+            // never ran. Preserve the device's original error if available.
+            unsafe { self.device.GetDeviceRemovedReason()? };
+            return Err(DXGI_ERROR_DEVICE_REMOVED.into());
+        }
+        Ok(completed)
     }
 
-    /// Waits on this thread, with its `event`, until the card has run
-    /// `job`.
+    /// Whether the card has run `job`.
+    pub(crate) fn done(&self, job: u64) -> bool {
+        self.completed_value().is_ok_and(|completed| completed >= job)
+    }
+
+    /// Waits on this thread's auto-reset `event` until the card has run
+    /// `job`, or returns an error if the device was removed.
     pub(crate) fn wait(&self, job: u64, event: HANDLE) -> windows::core::Result<()> {
+        if self.completed_value()? >= job {
+            return Ok(());
+        }
         // SAFETY: the lane's fence and the caller's event.
-        unsafe {
-            if self.fence.GetCompletedValue() < job {
-                self.fence.SetEventOnCompletion(job, event)?;
-                WaitForSingleObject(event, INFINITE);
+        unsafe { self.fence.SetEventOnCompletion(job, event)? };
+        loop {
+            // The event can also wake when D3D12 removes the device.
+            if unsafe { WaitForSingleObject(event, INFINITE) } != WAIT_OBJECT_0 {
+                return Err(windows::core::Error::from_thread());
+            }
+            if self.completed_value()? >= job {
+                return Ok(());
             }
         }
-        Ok(())
     }
 }
 
@@ -819,6 +837,52 @@ void main() {
     fn dwords(data: *mut u8, at: usize, n: usize) -> Vec<u32> {
         // SAFETY: the caller's mapping holds them.
         (0..n).map(|i| unsafe { data.cast::<u32>().add(at + i).read_volatile() }).collect()
+    }
+
+    #[test]
+    fn device_removal_does_not_complete_a_copy_job() {
+        const CHILD: &str = "VICTORY_TEST_REMOVE_COPY_DEVICE";
+        if std::env::var_os(CHILD).is_none() {
+            // D3D12 devices on the same adapter can be shared within a
+            // process. Remove the test device in its own process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "queue2::tests::device_removal_does_not_complete_a_copy_job", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            eprint!("{}", String::from_utf8_lossy(&output.stdout));
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success(), "the isolated copy lane test failed");
+            return;
+        }
+
+        let Some(warp) = Warp::new(1) else {
+            eprintln!("no WARP device; skipped");
+            return;
+        };
+        let Ok(device) = warp.device.cast::<ID3D12Device5>() else {
+            eprintln!("no ID3D12Device5 on WARP; skipped");
+            return;
+        };
+        // SAFETY: our isolated WARP device and an unsignalled test fence.
+        let gate: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+        let lane = &warp.second.down;
+        let list = lane.list().unwrap();
+        let job = lane.send(list, &[(&gate, 1)], 0).unwrap();
+        assert!(!lane.done(job));
+        // SAFETY: only the test child uses this WARP device.
+        unsafe { device.RemoveDevice() };
+        let removed = unsafe { device.GetDeviceRemovedReason() }.unwrap_err();
+        assert_eq!(unsafe { lane.fence.GetCompletedValue() }, u64::MAX);
+        let done = lane.done(job);
+        let waited = lane.wait(job, warp.event);
+        // SAFETY: the test owns the event and has finished waiting.
+        unsafe { windows::Win32::Foundation::CloseHandle(warp.event) }.unwrap();
+
+        assert!(!done, "a removed copy fence must not report completion");
+        assert_eq!(waited.unwrap_err().code(), removed.code());
+        assert_eq!(lane.list().err().expect("the lane was removed").code(), removed.code());
+        eprintln!("WARP reported device removal for the pending copy job");
     }
 
     /// What shaders wrote, read back through the down lane, is what the

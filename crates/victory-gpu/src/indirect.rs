@@ -37,7 +37,7 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=7, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -48,6 +48,10 @@ cbuffer Record : register(b0) {
     // run is left empty and costs nothing.
     uint has_count;
     uint count_offset;
+    // The first record this dispatch clamps: the caller dispatches one group
+    // per 64 records (see `record_clamp_as`), so a chunk's charges land in
+    // lane order rather than in whatever order the groups ran in.
+    uint base;
 };
 ByteAddressBuffer src_args : register(t0);
 ByteAddressBuffer count_buf : register(t1);
@@ -60,15 +64,14 @@ static const uint BUDGET = 1u << 27;
 static const uint MOST_DRAW = 1u << 23;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
-// Each group charges the budget once: the costs of its records go here,
-// one thread charges their sum, saturating as each record would in lane
-// order, and every thread then reads whether its own record fitted. A
-// compare and swap per record, 64 threads racing for one word, cost a
-// round for each record of a window, and in memory the CPU maps (where the
-// budget was, and is with VICTORY_INDIRECT_CARD_BUDGET=0) every atomic
-// crosses the bus on a card of its own.
-groupshared uint costs[64];
-groupshared uint fits[64];
+// Each active record charges the budget once, saturating without 32-bit
+// wraparound. A compare and swap per record, 64 threads racing for one
+// word, costs a round for each record of a window, and in memory the CPU
+// maps (where the budget was, and is with
+// VICTORY_INDIRECT_CARD_BUDGET=0) every atomic crosses the bus on a card of
+// its own. Charging a group's whole chunk from one thread instead looked
+// cheaper but made the fit depend on the order groups happened to run in,
+// which no barrier orders: see the note where the records charge.
 groupshared uint largest_asked;
 groupshared uint all_asked;
 [RootSignature(RS)]
@@ -79,11 +82,14 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
+    // The record this thread clamps: the caller runs one group per 64
+    // records, and `base` says which 64.
+    uint index = base + gi;
     // Threads past the records take part in the group's charge (cost 0)
     // and store nothing.
-    bool active = id.x < eff_count;
-    uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
+    bool active = index < eff_count;
+    uint src_at = args_offset + index * stride;
+    uint dst_at = index * stride;
     uint cost = 0;
     uint asked = 0;
     uint2 draw_counts = uint2(0, 0);
@@ -139,7 +145,6 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         cost = g.x * g.y * g.z * 128u;
         groups = g;
     }
-    costs[gi] = cost;
     GroupMemoryBarrierWithGroupSync();
     if (active && kind > 2) {
         // Diagnostics, in the budget buffer's next words (below): the
@@ -149,45 +154,31 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         InterlockedMax(largest_asked, asked, was);
         InterlockedAdd(all_asked, min(asked, 1u << 24), was);
     }
-    // The group's own records: none for a group past a count buffer's
-    // count (an execution may ask for thousands and count a few), which
-    // touches the budget not at all, as its threads did not before.
-    uint first = id.x - gi;
-    uint n = eff_count > first ? min(64u, eff_count - first) : 0u;
-    if (gi == 0 && n > 0) {
-        // What the records charge, from `before` on, in lane order: a
-        // record that does not fit whole runs empty and takes the rest.
-        // Only the group's own records are walked (one, clamped alone).
+    // Every record charges the budget on its own, in lane order within the
+    // group. The caller runs one group per 64 records with a barrier between
+    // them, so the chunks also charge in lane order: without that, the
+    // groups of one dispatch ran in no defined order and the scheduler
+    // decided which records fitted (with 128 records WARP kept the second
+    // chunk's first two and emptied the first chunk's, where lane order
+    // keeps the first chunk's). None of a chunk's records touch the budget
+    // for a chunk past a count buffer's count (an execution may ask for
+    // thousands and count a few).
+    bool over = false;
+    if (active && cost > 0) {
         uint before;
         budget.InterlockedOr(0, 0, before);
         [allow_uav_condition]
         while (before < BUDGET) {
-            uint next = before;
-            for (uint j = 0; j < n; j++) {
-                uint c = costs[j];
-                if (c > 0 && next < BUDGET) {
-                    next = (BUDGET - next <= c) ? BUDGET : (next + c);
-                }
-            }
-            if (next == before) break;
+            uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
             uint prev;
             budget.InterlockedCompareExchange(0, before, next, prev);
             if (prev == before) break;
             before = prev;
         }
-        uint at = before;
-        for (uint k = 0; k < n; k++) {
-            uint c = costs[k];
-            uint fit = 1;
-            if (c > 0) {
-                fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
-                at = (at >= BUDGET || BUDGET - at <= c) ? BUDGET : (at + c);
-            }
-            fits[k] = fit;
-        }
+        over = before >= BUDGET || BUDGET - before < cost;
     }
     GroupMemoryBarrierWithGroupSync();
-    if (gi == 0 && kind > 2 && n > 0) {
+    if (gi == 0 && kind > 2) {
         uint was;
         budget.InterlockedMax(4, largest_asked, was);
         budget.InterlockedAdd(8, all_asked, was);
@@ -195,7 +186,6 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (!active) {
         return;
     }
-    bool over = fits[gi] == 0;
     if (kind <= 1) {
         if (over) {
             draw_counts = uint2(0, 0);
@@ -447,7 +437,7 @@ fn record_clamp_as(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset, 0];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -481,12 +471,30 @@ fn record_clamp_as(
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
-            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
             l.SetComputeRootShaderResourceView(1, src_gpu);
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
             l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(records.div_ceil(64), 1, 1);
+            // One dispatch per 64 records, each after the last: a chunk's
+            // records charge the budget in lane order, and the budget is one
+            // word the chunks would otherwise race for. D3D12 runs the groups
+            // of one dispatch in no defined order, so a single dispatch of
+            // them charged in whatever order the scheduler picked: with 128
+            // records WARP kept the second chunk's first two and emptied the
+            // first chunk's, where lane order keeps the first chunk's. The
+            // barrier between the dispatches is what makes it lane order.
+            // `chunk[6]` is the chunk's first record.
+            let mut offset: u32 = 0;
+            while offset < records {
+                let mut chunk = constants;
+                chunk[6] = offset;
+                l.SetComputeRoot32BitConstants(0, 7, chunk.as_ptr().cast(), 0);
+                l.Dispatch(1, 1, 1);
+                offset += 64;
+                if offset < records {
+                    l.ResourceBarrier(&[uav_barrier()]);
+                }
+            }
         }
         l.ResourceBarrier(&second[skip..]);
     }
@@ -2212,7 +2220,8 @@ void work() {
         heap_pairs: [[Option<ID3D12DescriptorHeap>; 2]; 2],
         tables: [D3D12_GPU_DESCRIPTOR_HANDLE; 2],
         targets: [D3D12_CPU_DESCRIPTOR_HANDLE; 2],
-        depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
+        /// Kept with the bench: the view the depth clears go through.
+        _depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
         depth_tested: D3D12_CPU_DESCRIPTOR_HANDLE,
         stamps: ID3D12QueryHeap,
         back: ID3D12Resource,
@@ -2520,7 +2529,7 @@ void work() {
                     heap_pairs,
                     tables,
                     targets,
-                    depth_written,
+                    _depth_written: depth_written,
                     depth_tested,
                     stamps,
                     back,
